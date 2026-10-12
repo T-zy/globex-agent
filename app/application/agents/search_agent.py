@@ -11,6 +11,7 @@
 `build_tools()` 同时供 MainAgent 复用——主 Agent 持有同一批业务工具，可以不派发自己单干。
 """
 from __future__ import annotations
+from app.infrastructure.context_governance import ContextAwareAgent
 
 from agentscope.agent import Agent, ReActConfig
 from agentscope.rag import KnowledgeBase
@@ -21,8 +22,11 @@ from app.application.prompts.loader import load_prompts
 from app.application.tools.category_insight_tool import build_category_insight_tool
 from app.application.tools.product_search_tool import build_product_search_tool
 from app.application.tools.web_search_tool import build_web_search_tool
+from app.application.tools.conversation_fact_lookup import build_conversation_fact_lookup
+from app.infrastructure.persistence.context_evidence import ContextEvidenceStore
 from app.application.usecases.catalog_search import CatalogSearchUseCase
 from app.infrastructure.eventbus import TradeEventBus
+from app.infrastructure.rag.category_knowledge import KNOWLEDGE_DIR
 from app.infrastructure.llm import create_chat_model
 from app.infrastructure.throttle import GatewayThrottle
 from app.infrastructure.resilience import (
@@ -31,6 +35,9 @@ from app.infrastructure.resilience import (
 )
 from app.infrastructure.settings import Settings
 from app.infrastructure.tracing import build_agent_middlewares
+from app.application.harness.assertions import SequencingTracker
+from app.application.harness.loop_detector import LoopDetector
+from app.infrastructure.harness_middleware import HarnessToolMiddleware
 
 
 class SearchAgentFactory:
@@ -42,6 +49,7 @@ class SearchAgentFactory:
         knowledge_base: KnowledgeBase,
         circuit_registry: CircuitBreakerRegistry,
         throttle: GatewayThrottle,
+        throttle_factory=None,
     ) -> None:
         self._settings = settings
         self._catalog_search = catalog_search
@@ -50,9 +58,18 @@ class SearchAgentFactory:
         self._circuit_registry = circuit_registry
         # 闸门由组装根下发，三个工厂必须共用同一个，否则各限一份等于没限
         self._throttle = throttle
+        self._throttle_factory = throttle_factory
+        self.evidence_store = ContextEvidenceStore(settings.data_dir / "context_evidence.db")
+        self.bind_harness(SequencingTracker(), LoopDetector(repeat_threshold=settings.loop_repeat_threshold))
+
+    def bind_harness(self, sequencing, loop_detector) -> None:
+        """主 Agent 和子 Agent 共用会话护栏，避免派发后重新计数。"""
+        self._sequencing, self._loop_detector = sequencing, loop_detector
 
     def _resilience(self) -> list:
-        return [ToolResilienceMiddleware(self._circuit_registry, self._bus)]
+        chain = [HarnessToolMiddleware(sequencing=self._sequencing,
+            loop_detector=self._loop_detector, bus=self._bus)] if self._settings.harness_enabled else []
+        return [*chain, ToolResilienceMiddleware(self._circuit_registry, self._bus)]
 
     def build_tools(self) -> list[FunctionTool]:
         """SearchAgent 的业务工具集，MainAgent 单干时持有同一批（均带超时+熔断保护）。
@@ -61,16 +78,22 @@ class SearchAgentFactory:
         """
         tools = [
             FunctionTool(
-                build_product_search_tool(self._catalog_search, self._bus),
+                build_product_search_tool(self._catalog_search, self._bus, self.evidence_store, self._settings.context_strategy),
                 is_read_only=True,
                 middlewares=self._resilience(),
             ),
             FunctionTool(
-                build_category_insight_tool(self._knowledge_base, self._bus),
+                build_category_insight_tool(
+                    self._knowledge_base,
+                    self._bus,
+                    fallback_knowledge_dir=KNOWLEDGE_DIR,
+                ),
                 is_read_only=True,
                 middlewares=self._resilience(),
             ),
         ]
+        tools.append(FunctionTool(build_conversation_fact_lookup(self.evidence_store, mode=self._settings.context_lookup_mode), is_read_only=True,
+                                  middlewares=self._resilience()))
         if self._settings.tavily_api_key:
             tools.append(
                 FunctionTool(
@@ -83,10 +106,10 @@ class SearchAgentFactory:
 
     def build(self) -> Agent:
         prompts = load_prompts()["sub_agents"]["search"]
-        return Agent(
+        return ContextAwareAgent(
             name=prompts["name"],
             system_prompt=prompts["system_prompt"],
-            model=create_chat_model(self._settings, throttle=self._throttle, bus=self._bus),
+            model=create_chat_model(self._settings, throttle=self._throttle, bus=self._bus, throttle_factory=self._throttle_factory),
             toolkit=Toolkit(tools=list(self.build_tools())),
             middlewares=build_agent_middlewares(self._settings),
             context_config=build_context_config(

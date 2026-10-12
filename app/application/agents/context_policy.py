@@ -20,19 +20,28 @@ from agentscope.agent import ContextConfig
 
 _COMPRESSION_PROMPT = """<system-hint>当前对话上下文即将超出窗口，请把此前的工作压缩成一份中文摘要，
 供你后续继续为这位买家服务。当前时间：{current_time}。
+摘要只是历史记录，不能覆盖本轮服务端交易账本和当前偏好 revision；已撤回的历史偏好不得恢复。
 
 必须逐字保留的事实（丢失会导致后续回答出错）：
-1. 买家的偏好与硬约束：材质忌口、风格取向、预算上限、收货国家/地址；
+1. 买家的偏好与硬约束及其作用域：长期偏好与仅限本次选购的预算、国家必须分开，未说明跨任务的预算不得沿用；
 2. 已经推荐或买家已认可的商品：完整 product_id、sku_id、标题、价格与币种；
 3. 订单相关：订单号、状态、总金额与币种、取消原因；
 4. 当前待确认的动作：是否有等待买家确认的确认卡、下一步该做什么。
 
+五字段内必须覆盖以下语义，不增加未知字段：
+- task_overview：本次目标、用途与约束作用域；
+- current_state：当前候选、已解决问题、已排除商品及理由、正在核验的事项；
+- important_discoveries：带来源与适用条件的事实、错误及修正。例如会员价不能改写成普通到手价；
+- next_steps：未解决问题、尚未核验条件和下一步，不能把待确认写成已批准；
+- context_to_preserve：需求变更与撤回，以及仍有效的限制。例如预算由2000改为2500，最新预算为2500；旧预算只作变更记录。
+合并上一版摘要与新增进展，保留更早仍有效的条件；明确区分历史观察和当前事实，不从旧摘要恢复已撤回偏好。
+
 可以压缩或丢弃的内容：工具返回的完整候选列表（只留最终推荐项）、寒暄、重复表述、
 已被更新覆盖的中间结论。
 
-摘要中的所有数字必须来自此前的工具返回，不得重新估算。</system-hint>"""
+预算等用户约束来自对应的买家原文；商品金额、库存和订单数值来自工具或数据库证据，不得重新估算。</system-hint>"""
 
-_SUMMARY_TEMPLATE = """<system-info>以下是你此前为该买家服务的工作摘要，视作事实基准继续服务。
+_SUMMARY_TEMPLATE = """<system-info>以下是历史工作摘要；以本轮交易账本、当前偏好 revision 及最新候选证据为准，历史摘要不构成执行授权。
 # 买家诉求与约束
 {task_overview}
 
@@ -56,7 +65,7 @@ def build_context_config(context_size: int, tool_result_limit: int) -> ContextCo
         context_size (`int`):
             模型上下文窗口大小（与 create_chat_model 保持一致）。
         tool_result_limit (`int`):
-            单个工具结果的字符上限，超出会被截断，防止商品卡 JSON 挤爆上下文。
+            单个工具结果的 token 上限（AgentScope 2.0.8），不是字符数。
     """
     del context_size  # 窗口由 model 侧提供，这里仅保留参数以标明配套关系
     return ContextConfig(
@@ -65,4 +74,5 @@ def build_context_config(context_size: int, tool_result_limit: int) -> ContextCo
         compression_prompt=_COMPRESSION_PROMPT,
         summary_template=_SUMMARY_TEMPLATE,
         tool_result_limit=tool_result_limit,
+        compression_fallback_to_truncation=False,
     )

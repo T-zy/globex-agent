@@ -33,7 +33,9 @@ def build_remember_preference_tool(store: PreferenceStore, bus: TradeEventBus):
                 一句话偏好陈述，10 字以内最佳，如"不要塑料材质"。
         """
         snapshot = ShoppingContext.current()
-        buyer_id = snapshot.buyer_id if snapshot else "anonymous"
+        if snapshot is None:
+            return ToolChunk(content=[TextBlock(type="text", text="[error] 缺少可信买家上下文")], state=ToolResultState.ERROR)
+        buyer_id = snapshot.buyer_id
         session_id = ShoppingContext.current_session_id()
         bus.publish(
             session_id,
@@ -41,13 +43,14 @@ def build_remember_preference_tool(store: PreferenceStore, bus: TradeEventBus):
             {"tool": "remember_preference_tool", "args": {"kind": kind, "statement": statement}},
         )
         try:
-            await store.append(BuyerPreference(buyer_id=buyer_id, kind=kind, statement=statement))
+            normalized = await store.append(BuyerPreference(buyer_id=buyer_id, kind=kind, statement=statement, source_kind="agent", source_ref=session_id))
         except ValueError as err:
             bus.publish(session_id, "tool.result", {"tool": "remember_preference_tool", "error": str(err)})
             return ToolChunk(
                 content=[TextBlock(type="text", text=f"[error] {err}")],
                 state=ToolResultState.ERROR,
             )
+        statement = "；".join(p.statement for p in normalized) if normalized is not None else statement
         bus.publish(session_id, "tool.result", {"tool": "remember_preference_tool", "saved": statement})
         return ToolChunk(
             content=[TextBlock(type="text", text=f"已记住买家偏好：[{kind}] {statement}")],

@@ -8,6 +8,7 @@ create_order_tool / query_order_tool / cancel_order_tool。
 `build_tools()` 同时供 MainAgent 复用——主 Agent 持有同一批业务工具，可以不派发自己单干。
 """
 from __future__ import annotations
+from app.infrastructure.context_governance import ContextAwareAgent
 
 from agentscope.agent import Agent, ReActConfig
 from agentscope.tool import FunctionTool, Toolkit
@@ -26,6 +27,7 @@ from app.application.usecases.order_usecases import (
     QueryOrderUseCase,
 )
 from app.infrastructure.eventbus import TradeEventBus
+from app.infrastructure.persistence.context_evidence import ContextEvidenceStore
 from app.infrastructure.llm import create_chat_model
 from app.infrastructure.throttle import GatewayThrottle
 from app.infrastructure.resilience import (
@@ -34,6 +36,9 @@ from app.infrastructure.resilience import (
 )
 from app.infrastructure.settings import Settings
 from app.infrastructure.tracing import build_agent_middlewares
+from app.application.harness.assertions import SequencingTracker
+from app.application.harness.loop_detector import LoopDetector
+from app.infrastructure.harness_middleware import HarnessToolMiddleware
 
 
 class TradeAgentFactory:
@@ -46,23 +51,34 @@ class TradeAgentFactory:
         bus: TradeEventBus,
         circuit_registry: CircuitBreakerRegistry,
         throttle: GatewayThrottle,
+        throttle_factory=None,
     ) -> None:
         self._settings = settings
         self._place_order = place_order
         self._query_order = query_order
         self._cancel_order = cancel_order
         self._bus = bus
+        # 与搜索工厂共享持久证据文件，主/子 Agent 和恢复会话均按买家、会话核对。
+        self.evidence_store = ContextEvidenceStore(settings.data_dir / "context_evidence.db")
         self._circuit_registry = circuit_registry
         self._throttle = throttle
+        self._throttle_factory = throttle_factory
+        self.bind_harness(SequencingTracker(), LoopDetector(repeat_threshold=settings.loop_repeat_threshold))
+
+    def bind_harness(self, sequencing, loop_detector) -> None:
+        """与搜索及主 Agent 共享顺序和循环状态；不改变原生权限审批。"""
+        self._sequencing, self._loop_detector = sequencing, loop_detector
 
     def _resilience(self) -> list:
-        return [ToolResilienceMiddleware(self._circuit_registry, self._bus)]
+        chain = [HarnessToolMiddleware(sequencing=self._sequencing,
+            loop_detector=self._loop_detector, bus=self._bus)] if self._settings.harness_enabled else []
+        return [*chain, ToolResilienceMiddleware(self._circuit_registry, self._bus)]
 
     def build_tools(self) -> list[FunctionTool]:
         """TradeAgent 的业务工具集，MainAgent 单干时持有同一批（均带超时+熔断保护）。"""
         return [
             FunctionTool(
-                build_create_order_tool(self._place_order, self._bus),
+                build_create_order_tool(self._place_order, self._bus, self.evidence_store),
                 middlewares=self._resilience(),
             ),
             FunctionTool(
@@ -79,10 +95,10 @@ class TradeAgentFactory:
     def build(self) -> Agent:
         prompts = load_prompts()["sub_agents"]["trade"]
         return allow_business_tools(
-            Agent(
+            ContextAwareAgent(
                 name=prompts["name"],
                 system_prompt=prompts["system_prompt"],
-                model=create_chat_model(self._settings, throttle=self._throttle, bus=self._bus),
+                model=create_chat_model(self._settings, throttle=self._throttle, bus=self._bus, throttle_factory=self._throttle_factory),
                 toolkit=Toolkit(tools=list(self.build_tools())),
                 middlewares=build_agent_middlewares(self._settings),
                 context_config=build_context_config(

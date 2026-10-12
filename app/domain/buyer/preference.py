@@ -21,12 +21,19 @@ class BuyerPreference:
     kind: str  # like / dislike
     statement: str  # 一句话偏好陈述，如"不要塑料材质"
     created_at: str = ""
+    memory_id: str = ""
+    version: int = 1
+    source_kind: str = "user"
+    source_ref: str = ""
 
     def __post_init__(self) -> None:
         if self.kind not in VALID_KINDS:
             raise ValueError(f"BuyerPreference.kind 必须是 {VALID_KINDS}：{self.kind}")
         if not self.statement or not self.statement.strip():
             raise ValueError("BuyerPreference.statement required")
+        if len(self.statement) > 500:
+            raise ValueError("偏好不能超过 500 字符")
+        object.__setattr__(self, "statement", self.statement.strip())
         if not self.created_at:
             object.__setattr__(self, "created_at", datetime.now(timezone.utc).isoformat())
 
@@ -50,3 +57,11 @@ class PreferenceStore(ABC):
 
         不按 kind 区分：同 statement 的 like 与 dislike 条目会一并清除。
         """
+
+    async def replace(self, buyer_id: str, previous_statement: str, preference: BuyerPreference) -> bool:
+        """原子替换原文匹配的偏好，未命中不写入新值。"""
+        raise NotImplementedError("当前偏好存储不支持原子替换")
+
+
+class MemoryConflict(ValueError):
+    """记忆版本过期或存在需要用户明确解决的冲突。"""
